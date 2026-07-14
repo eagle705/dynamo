@@ -1,0 +1,225 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# K-EXAONE-236B-A23B-FP8 vLLM disaggregated prefill/decode on B200 (InfiniBand).
+#
+# Model: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+# HF card: https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+#   vLLM upstream: --reasoning-parser deepseek_v3 --tool-call-parser hermes
+#                  --gpu_memory_utilization 0.94
+#   Dynamo parsers: --dyn-reasoning-parser deepseek_r1 --dyn-tool-call-parser hermes
+#
+# Shape: 1 prefill replica + 1 decode replica, each on 1 B200 node (TP=8 + EP).
+# Total: 2 nodes x 8 GPUs = 16 GPUs.
+#
+# Service keys `prefill` / `decode` (not VllmPrefillWorker) stay within Grove's
+# 45-character pod naming limit.
+#
+# Prerequisites:
+#   - Model weights on shared-model-cache PVC (../../model-cache/model-download.yaml)
+#   - hf-token-secret in namespace
+#   - InfiniBand RDMA for NIXL KV transfer between prefill and decode pods
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: k-exaone-disagg-fp8
+spec:
+  backendFramework: vllm
+  envs:
+    - name: HF_HOME
+      value: /models
+    - name: HF_HUB_OFFLINE
+      value: "1"
+    - name: GLOO_SOCKET_IFNAME
+      value: eth0
+    - name: NCCL_SOCKET_IFNAME
+      value: eth0
+  pvcs:
+    - name: shared-model-cache
+      create: false
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+          workingDir: /workspace/examples/backends/vllm
+    prefill:
+      componentType: worker
+      subComponentType: prefill
+      envFromSecret: hf-token-secret
+      replicas: 1
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+      sharedMemory:
+        size: 200Gi
+      resources:
+        limits:
+          gpu: "4"
+          custom:
+            rdma/ib: "4"
+        requests:
+          gpu: "4"
+          custom:
+            rdma/ib: "4"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-B200
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+          workingDir: /workspace/examples/backends/vllm
+          # ~90 min for first launch (weights + warmup): 10 * 540 = 5400s.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 540
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+          env:
+            - name: SERVED_MODEL_NAME
+              value: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+            - name: MODEL_PATH
+              value: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "5400"
+            - name: VLLM_SKIP_P2P_CHECK
+              value: "1"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: UCX_TLS
+              value: "rc_x,rc,cuda_copy,cuda_ipc"
+            - name: UCX_NET_DEVICES
+              value: "mlx5_0:1"
+            - name: UCX_IB_ADDR_TYPE
+              value: "eth"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: INFO
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              ulimit -l unlimited && exec python3 -m dynamo.vllm \
+                --model "${MODEL_PATH}" \
+                --served-model-name "${SERVED_MODEL_NAME}" \
+                --trust-remote-code \
+                --tensor-parallel-size 4 \
+                --enable-expert-parallel \
+                --disaggregation-mode prefill \
+                --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
+                --gpu-memory-utilization 0.94 \
+                --dyn-reasoning-parser deepseek_r1 \
+                --dyn-tool-call-parser hermes \
+                --block-size 256 \
+                --max-num-seqs 256
+    decode:
+      componentType: worker
+      subComponentType: decode
+      envFromSecret: hf-token-secret
+      replicas: 1
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+      sharedMemory:
+        size: 200Gi
+      resources:
+        limits:
+          gpu: "4"
+          custom:
+            rdma/ib: "4"
+        requests:
+          gpu: "4"
+          custom:
+            rdma/ib: "4"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-B200
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+          workingDir: /workspace/examples/backends/vllm
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 540
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+          env:
+            - name: SERVED_MODEL_NAME
+              value: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+            - name: MODEL_PATH
+              value: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "5400"
+            - name: VLLM_SKIP_P2P_CHECK
+              value: "1"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: UCX_TLS
+              value: "rc_x,rc,cuda_copy,cuda_ipc"
+            - name: UCX_NET_DEVICES
+              value: "mlx5_0:1"
+            - name: UCX_IB_ADDR_TYPE
+              value: "eth"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: INFO
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              ulimit -l unlimited && exec python3 -m dynamo.vllm \
+                --model "${MODEL_PATH}" \
+                --served-model-name "${SERVED_MODEL_NAME}" \
+                --trust-remote-code \
+                --tensor-parallel-size 4 \
+                --enable-expert-parallel \
+                --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}' \
+                --gpu-memory-utilization 0.94 \
+                --dyn-reasoning-parser deepseek_r1 \
+                --dyn-tool-call-parser hermes \
+                --block-size 256 \
+                --max-num-seqs 256

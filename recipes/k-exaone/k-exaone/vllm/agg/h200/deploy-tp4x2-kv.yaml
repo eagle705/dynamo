@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# K-EXAONE-236B-A23B-FP8 vLLM aggregated serving on H200 with KV-aware routing.
+#
+# Topology: 2 decode workers, each 1 node x 4 H200 GPUs = TP4.
+# Total requested GPU: 8 H200 GPUs.
+#
+# Frontend: approximate KV-aware routing (`--router-mode kv --no-kv-events`).
+# This avoids requiring backend KV event publication while still using prefix
+# hashing to route repeated prefixes to the same worker.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: k-exaone-h200-vllm-agg-fp8-tp4x2-kv
+spec:
+  backendFramework: vllm
+  envs:
+    - name: HF_HOME
+      value: /models
+    - name: HF_HUB_OFFLINE
+      value: "1"
+    - name: GLOO_SOCKET_IFNAME
+      value: eth0
+    - name: NCCL_SOCKET_IFNAME
+      value: eth0
+  pvcs:
+    - name: shared-model-cache
+      create: false
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+          imagePullPolicy: Always
+          workingDir: /workspace/examples/backends/vllm
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - python3 -m dynamo.frontend --router-mode kv --no-kv-events --http-port 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 360
+    decode:
+      componentType: worker
+      subComponentType: decode
+      envFromSecret: hf-token-secret
+      replicas: 2
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+      sharedMemory:
+        size: 200Gi
+      resources:
+        limits:
+          gpu: "4"
+        requests:
+          gpu: "4"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-H200
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+          imagePullPolicy: Always
+          workingDir: /workspace/examples/backends/vllm
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 540
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+          env:
+            - name: SERVED_MODEL_NAME
+              value: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+            - name: MODEL_PATH
+              value: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "5400"
+            - name: VLLM_SKIP_P2P_CHECK
+              value: "1"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              ulimit -l unlimited && exec python3 -m dynamo.vllm \
+                --model "${MODEL_PATH}" \
+                --served-model-name "${SERVED_MODEL_NAME}" \
+                --trust-remote-code \
+                --tensor-parallel-size 4 \
+                --enable-expert-parallel \
+                --gpu-memory-utilization 0.94 \
+                --dyn-reasoning-parser deepseek_r1 \
+                --dyn-tool-call-parser hermes \
+                --block-size 256 \
+                --max-num-seqs 256

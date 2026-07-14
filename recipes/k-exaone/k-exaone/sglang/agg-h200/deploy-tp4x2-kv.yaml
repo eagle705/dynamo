@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# K-EXAONE-236B-A23B-FP8 SGLang aggregated serving on H200.
+#
+# Topology: 2 decode workers, each 1 node x 4 H200 GPUs = TP4.
+# Total requested GPU: 8 H200 GPUs.
+#
+# Frontend: KV-aware routing. SGLang aggregated workers do not publish KV
+# events in this recipe, so the frontend uses prefix-hash based KV routing via
+# --router-mode kv --no-kv-events.
+#
+# Model: LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+# HF card: https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B-FP8
+#   - SGLang upstream: --tp-size 4 --reasoning-parser qwen3
+#   - Tool parser: hermes
+#   - Default enable_thinking=True; set chat_template_kwargs.enable_thinking=false for latency.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: k-exaone-h200-agg-fp8-tp4x2-kv
+spec:
+  backendFramework: sglang
+  envs:
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: hf-token-secret
+          key: HF_TOKEN
+    - name: HF_HOME
+      value: /models
+    - name: HF_HUB_OFFLINE
+      value: "1"
+    - name: GLOO_SOCKET_IFNAME
+      value: eth0
+    - name: NCCL_SOCKET_IFNAME
+      value: eth0
+    - name: NCCL_CUMEM_ENABLE
+      value: "1"
+    - name: SGLANG_JIT_DEEPGEMM_PRECOMPILE
+      value: "0"
+    - name: SGLANG_JIT_DEEPGEMM_FAST_WARMUP
+      value: "1"
+
+  pvcs:
+    - name: shared-model-cache
+      create: false
+
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+      extraPodSpec:
+        mainContainer:
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - python3 -m dynamo.frontend --router-mode kv --no-kv-events --http-port 8000
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.2.1
+          imagePullPolicy: Always
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 360
+
+    decode:
+      componentType: worker
+      subComponentType: decode
+      replicas: 2
+      resources:
+        limits:
+          gpu: "4"
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+      sharedMemory:
+        size: 200Gi
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-H200
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+        mainContainer:
+          command:
+            - bash
+            - -c
+          args:
+            - |
+              set -Eeuo pipefail
+              echo "PRESTART_GPU_GUARD_BEGIN role=decode ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              nvidia-smi -L
+              nvidia-smi --query-gpu=index,uuid,memory.total,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits
+              visible_count="$(nvidia-smi -L | grep -c '^GPU ')"
+              if [ "${visible_count}" -ne 4 ]; then
+                echo "PRESTART_GPU_GUARD_FAIL class=gpu_visibility_count_mismatch role=decode visible_count=${visible_count} expected=4"
+                exit 96
+              fi
+              echo "PRESTART_GPU_GUARD_PASS role=decode"
+              exec python3 -m dynamo.sglang \
+                --model-path LGAI-EXAONE/K-EXAONE-236B-A23B-FP8 \
+                --served-model-name LGAI-EXAONE/K-EXAONE-236B-A23B-FP8 \
+                --trust-remote-code \
+                --tp 4 \
+                --attention-backend fa3 \
+                --chunked-prefill-size 4096 \
+                --disable-flashinfer-autotune \
+                --dyn-tool-call-parser hermes \
+                --dyn-reasoning-parser qwen3 \
+                --mem-fraction-static 0.80 \
+                --host 0.0.0.0 \
+                --watchdog-timeout 3600
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.2.1
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 0
+          startupProbe:
+            failureThreshold: 60
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 60
+            timeoutSeconds: 5
+          workingDir: /workspace/
