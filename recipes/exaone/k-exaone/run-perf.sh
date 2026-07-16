@@ -24,11 +24,27 @@ set -Eeuo pipefail
 #   MTP_MODE=mtp RUN_LABEL=<mtp-run-label> SERVICE_NAME=<mtp-frontend> ./run-perf.sh
 #
 # Override knobs:
+#   BENCHMARK_MODE=multi-turn  Run the dedicated RR-vs-KV multi-turn matrix.
 #   APPLY_DGD=0         Skip kubectl apply/wait; only run AIPerf.
 #   TEARDOWN_AFTER=1    Delete runner pod and DGD after benchmark.
 #   DEPLOY_FILE=<path>  Use an explicit manifest.
 #   DGD_NAME=<name>     Use an explicit DGD name.
 #   SERVICE_NAME=<name> Use an explicit frontend service name.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+BENCHMARK_MODE="${BENCHMARK_MODE:-single-turn}"
+case "${BENCHMARK_MODE}" in
+  single-turn) ;;
+  multi-turn)
+    exec ./run-multiturn-perf.sh
+    ;;
+  *)
+    echo "Unsupported BENCHMARK_MODE='${BENCHMARK_MODE}'. Use single-turn or multi-turn." >&2
+    exit 1
+    ;;
+esac
 
 NAMESPACE="${NAMESPACE:-dynamo-demo}"
 HARDWARE="${HARDWARE:-h200}"

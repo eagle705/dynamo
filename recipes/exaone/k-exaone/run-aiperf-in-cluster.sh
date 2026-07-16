@@ -94,12 +94,28 @@ RUNNER_NAME="${RUNNER_NAME:-k-exaone-aiperf-runner}"
 
 CONCURRENCIES="${CONCURRENCIES:-8 16 32 48 64}"
 REQUEST_MULTIPLIER="${REQUEST_MULTIPLIER:-2}"
+PROFILE_MODE="${PROFILE_MODE:-single-turn}"
+CONVERSATION_MULTIPLIER="${CONVERSATION_MULTIPLIER:-2}"
+CONVERSATION_TURN_MEAN="${CONVERSATION_TURN_MEAN:-3}"
+CONVERSATION_TURN_STDDEV="${CONVERSATION_TURN_STDDEV:-0}"
+CONVERSATION_TURN_DELAY_MEAN="${CONVERSATION_TURN_DELAY_MEAN:-0}"
+CONVERSATION_TURN_DELAY_STDDEV="${CONVERSATION_TURN_DELAY_STDDEV:-0}"
 WARMUP_REQUEST_COUNT="${WARMUP_REQUEST_COUNT:-8}"
 WORKERS_MAX="${WORKERS_MAX:-252}"
 RECORD_PROCESSORS="${RECORD_PROCESSORS:-32}"
 AIPERF_VERSION="${AIPERF_VERSION:-0.7.0}"
 TRANSFORMERS_SPEC="${TRANSFORMERS_SPEC:-transformers>=5.1.0}"
 TOKENIZERS_SPEC="${TOKENIZERS_SPEC:-tokenizers>=0.22.2}"
+NUM_DATASET_ENTRIES="${NUM_DATASET_ENTRIES:-}"
+RANDOM_SEED="${RANDOM_SEED:-}"
+
+case "${PROFILE_MODE}" in
+  single-turn|multi-turn) ;;
+  *)
+    echo "Unsupported PROFILE_MODE='${PROFILE_MODE}'. Use single-turn or multi-turn." >&2
+    exit 1
+    ;;
+esac
 
 REMOTE_ARTIFACT_ROOT="${REMOTE_ARTIFACT_ROOT:-/artifacts/${RUN_LABEL}}"
 LOCAL_ARTIFACT_ROOT="${LOCAL_ARTIFACT_ROOT:-${HOME}/artifacts}"
@@ -140,7 +156,19 @@ echo "Precision:          ${PRECISION}"
 echo "MTP mode:           ${MTP_MODE}"
 echo "Run label:          ${RUN_LABEL}"
 echo "Concurrencies:      ${CONCURRENCIES}"
+echo "Profile mode:       ${PROFILE_MODE}"
+if [ "${PROFILE_MODE}" = "multi-turn" ]; then
+  echo "Conversation mult:  ${CONVERSATION_MULTIPLIER}"
+  echo "Turn mean/stddev:   ${CONVERSATION_TURN_MEAN}/${CONVERSATION_TURN_STDDEV}"
+  echo "Turn delay mean/sd: ${CONVERSATION_TURN_DELAY_MEAN}/${CONVERSATION_TURN_DELAY_STDDEV} ms"
+fi
 echo "Transformers spec:  ${TRANSFORMERS_SPEC}"
+if [ -n "${NUM_DATASET_ENTRIES}" ]; then
+  echo "Dataset entries:    ${NUM_DATASET_ENTRIES}"
+fi
+if [ -n "${RANDOM_SEED}" ]; then
+  echo "Random seed:        ${RANDOM_SEED}"
+fi
 echo "Remote artifacts:   ${REMOTE_ARTIFACT_ROOT}"
 echo "Local output dir:   ${LOCAL_OUTPUT_DIR}"
 echo "Stream logs:        ${STREAM_LOGS}"
@@ -208,6 +236,18 @@ spec:
           value: "${CONCURRENCIES}"
         - name: REQUEST_MULTIPLIER
           value: "${REQUEST_MULTIPLIER}"
+        - name: PROFILE_MODE
+          value: "${PROFILE_MODE}"
+        - name: CONVERSATION_MULTIPLIER
+          value: "${CONVERSATION_MULTIPLIER}"
+        - name: CONVERSATION_TURN_MEAN
+          value: "${CONVERSATION_TURN_MEAN}"
+        - name: CONVERSATION_TURN_STDDEV
+          value: "${CONVERSATION_TURN_STDDEV}"
+        - name: CONVERSATION_TURN_DELAY_MEAN
+          value: "${CONVERSATION_TURN_DELAY_MEAN}"
+        - name: CONVERSATION_TURN_DELAY_STDDEV
+          value: "${CONVERSATION_TURN_DELAY_STDDEV}"
         - name: WARMUP_REQUEST_COUNT
           value: "${WARMUP_REQUEST_COUNT}"
         - name: WORKERS_MAX
@@ -220,6 +260,10 @@ spec:
           value: "${TRANSFORMERS_SPEC}"
         - name: TOKENIZERS_SPEC
           value: "${TOKENIZERS_SPEC}"
+        - name: NUM_DATASET_ENTRIES
+          value: "${NUM_DATASET_ENTRIES}"
+        - name: RANDOM_SEED
+          value: "${RANDOM_SEED}"
         - name: AIPERF_SERVER_METRICS_URLS
           value: "${AIPERF_SERVER_METRICS_URLS}"
         - name: AIPERF_GPU_TELEMETRY_URLS
@@ -307,10 +351,15 @@ spec:
             local c="\$1"
             local artifact_dir="\${REMOTE_ARTIFACT_ROOT}/pareto-c\${c}"
             local request_count=\$((c * REQUEST_MULTIPLIER))
+            local conversation_num=\$((c * CONVERSATION_MULTIPLIER))
             mkdir -p "\${artifact_dir}"
             echo ""
             echo "============================================================"
-            echo "Running concurrency=\${c}, request_count=\${request_count}"
+            if [ "\${PROFILE_MODE}" = "multi-turn" ]; then
+              echo "Running concurrency=\${c}, conversation_num=\${conversation_num}, turns=\${CONVERSATION_TURN_MEAN}+/-\${CONVERSATION_TURN_STDDEV}"
+            else
+              echo "Running concurrency=\${c}, request_count=\${request_count}"
+            fi
             echo "Artifact dir: \${artifact_dir}"
             echo "============================================================"
 
@@ -331,28 +380,52 @@ spec:
             fi
 
             set +e
-            aiperf profile \
-              --model "\${MODEL}" \
-              --tokenizer "\${TOKENIZER}" \
-              --tokenizer-trust-remote-code \
-              --url "http://\${ENDPOINT}" \
-              --endpoint-type chat \
-              --endpoint /v1/chat/completions \
-              --streaming \
-              --isl "\${ISL}" \
-              --osl "\${OSL}" \
-              --extra-inputs "max_tokens:\${OSL}" \
-              --extra-inputs "min_tokens:\${OSL}" \
-              --extra-inputs "ignore_eos:true" \
-              --concurrency "\${c}" \
-              --request-count "\${request_count}" \
-              --warmup-request-count "\${WARMUP_REQUEST_COUNT}" \
-              --workers-max "\${WORKERS_MAX}" \
-              --record-processors "\${RECORD_PROCESSORS}" \
-              --ui simple \
-              --artifact-dir "\${artifact_dir}" \
-              "\${SERVER_METRICS_ARGS[@]}" \
-              "\${GPU_TELEMETRY_ARGS[@]}"
+            DATASET_ARGS=()
+            if [ -n "\${NUM_DATASET_ENTRIES:-}" ]; then
+              DATASET_ARGS+=(--num-dataset-entries "\${NUM_DATASET_ENTRIES}")
+            fi
+            if [ -n "\${RANDOM_SEED:-}" ]; then
+              DATASET_ARGS+=(--random-seed "\${RANDOM_SEED}")
+            fi
+
+            COMMON_ARGS=(
+              --model "\${MODEL}"
+              --tokenizer "\${TOKENIZER}"
+              --tokenizer-trust-remote-code
+              --url "http://\${ENDPOINT}"
+              --endpoint-type chat
+              --endpoint /v1/chat/completions
+              --streaming
+              --isl "\${ISL}"
+              --osl "\${OSL}"
+              --extra-inputs "max_tokens:\${OSL}"
+              --extra-inputs "min_tokens:\${OSL}"
+              --extra-inputs "ignore_eos:true"
+              --concurrency "\${c}"
+              --warmup-request-count "\${WARMUP_REQUEST_COUNT}"
+              --workers-max "\${WORKERS_MAX}"
+              --record-processors "\${RECORD_PROCESSORS}"
+              --ui simple
+              --artifact-dir "\${artifact_dir}"
+              "\${DATASET_ARGS[@]}"
+            )
+            if [ "\${PROFILE_MODE}" = "multi-turn" ]; then
+              aiperf profile \
+                "\${COMMON_ARGS[@]}" \
+                --conversation-num "\${conversation_num}" \
+                --conversation-turn-mean "\${CONVERSATION_TURN_MEAN}" \
+                --conversation-turn-stddev "\${CONVERSATION_TURN_STDDEV}" \
+                --conversation-turn-delay-mean "\${CONVERSATION_TURN_DELAY_MEAN}" \
+                --conversation-turn-delay-stddev "\${CONVERSATION_TURN_DELAY_STDDEV}" \
+                "\${SERVER_METRICS_ARGS[@]}" \
+                "\${GPU_TELEMETRY_ARGS[@]}"
+            else
+              aiperf profile \
+                "\${COMMON_ARGS[@]}" \
+                --request-count "\${request_count}" \
+                "\${SERVER_METRICS_ARGS[@]}" \
+                "\${GPU_TELEMETRY_ARGS[@]}"
+            fi
             local rc="\$?"
             set -e
             echo "\${rc}" > "\${artifact_dir}/aiperf_exit_code.txt"
@@ -378,7 +451,15 @@ spec:
           MTP_MODE=\${MTP_MODE}
           RUN_LABEL=\${RUN_LABEL}
           CONCURRENCIES=\${CONCURRENCIES}
+          PROFILE_MODE=\${PROFILE_MODE}
           REQUEST_MULTIPLIER=\${REQUEST_MULTIPLIER}
+          CONVERSATION_MULTIPLIER=\${CONVERSATION_MULTIPLIER}
+          CONVERSATION_TURN_MEAN=\${CONVERSATION_TURN_MEAN}
+          CONVERSATION_TURN_STDDEV=\${CONVERSATION_TURN_STDDEV}
+          CONVERSATION_TURN_DELAY_MEAN=\${CONVERSATION_TURN_DELAY_MEAN}
+          CONVERSATION_TURN_DELAY_STDDEV=\${CONVERSATION_TURN_DELAY_STDDEV}
+          NUM_DATASET_ENTRIES=\${NUM_DATASET_ENTRIES}
+          RANDOM_SEED=\${RANDOM_SEED}
           AIPERF_VERSION=\${AIPERF_VERSION}
           TRANSFORMERS_SPEC=\${TRANSFORMERS_SPEC}
           TOKENIZERS_SPEC=\${TOKENIZERS_SPEC}
@@ -585,6 +666,103 @@ path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 PY
 }
 
+summarize_turn_metrics() {
+  local profile_jsonl="$1"
+  local summary_csv="$2"
+
+  if [ ! -f "${profile_jsonl}" ]; then
+    return 0
+  fi
+
+  python3 - "${profile_jsonl}" "${summary_csv}" <<'PY'
+import csv
+import json
+import math
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+groups = defaultdict(lambda: {"ttft": [], "latency": [], "isl": [], "osl": []})
+
+with source.open() as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        metadata = record.get("metadata", {})
+        if metadata.get("benchmark_phase") != "profiling":
+            continue
+        turn = metadata.get("turn_index")
+        if turn is None:
+            continue
+        metrics = record.get("metrics", {})
+        values = groups[int(turn)]
+        for key, target in (
+            ("time_to_first_token", "ttft"),
+            ("request_latency", "latency"),
+            ("input_sequence_length", "isl"),
+            ("output_sequence_length", "osl"),
+        ):
+            value = metrics.get(key, {}).get("value")
+            if isinstance(value, (int, float)):
+                values[target].append(float(value))
+
+def percentile(values, q):
+    if not values:
+        return ""
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+rows = []
+for turn, values in sorted(groups.items()):
+    rows.append((str(turn), values))
+
+followup = {"ttft": [], "latency": [], "isl": [], "osl": []}
+for turn, values in groups.items():
+    if turn >= 1:
+        for key in followup:
+            followup[key].extend(values[key])
+if followup["ttft"]:
+    rows.append(("followup_turns", followup))
+
+destination.parent.mkdir(parents=True, exist_ok=True)
+with destination.open("w", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow([
+        "turn",
+        "count",
+        "ttft_p50_ms",
+        "ttft_p95_ms",
+        "ttft_p99_ms",
+        "request_latency_p50_ms",
+        "request_latency_p95_ms",
+        "request_latency_p99_ms",
+        "input_tokens_avg",
+        "output_tokens_avg",
+    ])
+    for label, values in rows:
+        writer.writerow([
+            label,
+            len(values["ttft"]),
+            percentile(values["ttft"], 0.50),
+            percentile(values["ttft"], 0.95),
+            percentile(values["ttft"], 0.99),
+            percentile(values["latency"], 0.50),
+            percentile(values["latency"], 0.95),
+            percentile(values["latency"], 0.99),
+            sum(values["isl"]) / len(values["isl"]) if values["isl"] else "",
+            sum(values["osl"]) / len(values["osl"]) if values["osl"] else "",
+        ])
+PY
+}
+
 copy_concurrency_artifacts() {
   local c="$1"
   local remote_dir="${REMOTE_ARTIFACT_ROOT}/pareto-c${c}"
@@ -613,6 +791,7 @@ copy_concurrency_artifacts() {
 
   if [ "${COPY_RAW_PROFILE_EXPORT}" = "1" ]; then
     copy_remote_gzip_chunks_if_present "${remote_dir}/profile_export.jsonl" "${local_dir}/profile_export.jsonl" "pareto-c${c}/profile_export.jsonl" || true
+    summarize_turn_metrics "${local_dir}/profile_export.jsonl" "${local_dir}/turn_metrics_summary.csv"
   fi
 
   local exit_code
